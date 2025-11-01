@@ -355,9 +355,17 @@ For this task, you will need to use the profiling tool for NeuronDevices: `neuro
    `neuron-profile view --output-format summary-text ...` in Question 2. Feel free to learn more about `neuron-profile` functionality from the [user guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/tools/neuron-sys-tools/neuron-profile-user-guide.html) and interesting performance metrics for NKI kernels from the [NKI performance guide](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/nki_perf_guide.html).
 
 ### Step 3: Matrix Transpose
-You have worked with the Vector Engine, which specializes in vector operations like vector addition. However in Part 2, you not only need to perform vector operations, but you will also need to perform matrix operations.
+### Matrix Operations on a NeuronCore
+Before you begin, we will demonstrate how to perform matrix operations on a NeuronCore. As discussed earlier, a NeuronCore is equipped with various compute engines, each optimized for specific types of arithmetic operations. The Tensor Engine on Trainium is specifically designed to accelerate these matrix operations, such as matrix multiplication and matrix transpose. 
 
-Here you'll try out writing your own baby kernel for transposing a matrix using the tensor engine before moving on to a more complicated kernel in Part 2. Take a look at the starter code in `kernels.py`. Your kernel should accept a single 2D tensor of shape (M, N) as input and return a 2D tensor of shape (N, M). The only restriction on M and N is that both are divisible by 128, the maximum partition dimension.
+<p align="center">
+  <img src="/handout/tensor_engine.png" width=60% height=60%>
+</p>
+
+The above image depicts the architecture of the Tensor Engine. The Tensor Engine is built around a 128x128 [systolic processing array](https://gfxcourses.stanford.edu/cs149/fall25/lecture/proghardware/slide_10) which streams matrix data input from SBUF (on-chip storage) and writes the output to PSUM (also on-chip storage). Like SBUF, PSUM is fast on-chip memory, however it is much smaller than SBUF (2MiB vs 28 MiB) and serves a dedicated purpose of storing matrix multiplication results computed by the Tensor Engine. The Tensor Engine is able to read-add-write to every address in PSUM. Therefore, PSUM is useful when executing large matrix multiplications in a tiled manner, where the results of each matrix multiply are accumulated into the same output tile.
+
+### Writing the kernel
+Here you'll try writing your own baby kernel for transposing a matrix using the tensor engine before moving on to a more complicated kernel involving actual matmuls in Part 2. Take a look at the starter code in `kernels.py`. Your kernel should accept a single 2D tensor of shape (M, N) as input and return a 2D tensor of shape (N, M). The only restriction on M and N is that both are divisible by 128, the maximum partition dimension.
 
 ```
 @nki.compiler.skip_middle_end_transformations
@@ -376,12 +384,10 @@ def matrix_transpose(a_tensor):
 
 To actually perform the transpose, you must call [nisa.nc_transpose](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.isa.nc_transpose.html#nki.isa.nc_transpose), which is a built-in instruction that uses the Tensor Engine to transpose tiles of size up to 128x128, storing the result in PSUM. You are **not** allowed to use other compute instructions, including `nisa.dma_tranpose` or `nl.transpose`. (Memory instructions, including `nisa.dma_copy` and `nl.ndarray`, are of course allowed.)
 
-As discussed previously, a multi-dimensional NKI tensor requires one of its dimensions to be mapped to the partition dimension (`P`)  of physical memory. We also define an NKI Tile as any NKI Tensor with the first dimension being the partition dimension. Any remaining dimensions are known as free dimensions. Note that although a tensor can nominally have multiple free dimensions, when performing computation, the hardware -- specifically, the SBUF layout -- forces us to consider the data in terms of 2D tiles (with a single free dimension).
-
 Since you will be transposing matrices much larger than 128x128, your kernel should manage the movement of data tiles to and from HBM/SBUF. It might be useful to revisit the vector addition kernels from earlier to see how they allocate and move data.
 
 > [!TIP]
-> `nisa.dma_copy` only works on tensors in SBUF/HBM. Since the output of `nisa.nc_tranpose` is a PSUM tile, you'll need to copy it to 
+> `nisa.dma_copy` only works on tensors in SBUF/HBM. Since the output of `nisa.nc_transpose` is a PSUM tile, you'll need to copy it to SBUF first. You might find [`nisa.tensor_copy`](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.isa.tensor_copy.html#nki.isa.tensor_copy) useful for this.
 
 **What you need to do:**
 1.  Fill in the kernel with your implementation. Then test it on a 1024x1024 matrix by running
@@ -398,21 +404,12 @@ Since you will be transposing matrices much larger than 128x128, your kernel sho
 
 Now that you’ve learned how to efficiently move data on a NeuronCore, it is time to program an actual Trainium kernel yourself. In this section, your task is to implement a kernel that performs both convolution and an operation called "max pooling". As we discussed in class, these two operations are a fundamental component of modern Convolutional Neural Networks (CNNs), which are extensively used for computer vision tasks. An important detail is that your implementation of these two operations will be "fused", mean you will implement the computation on Trainium without dumping intermediate values to off-chip HBM. 
 
-### Matrix Operations on a NeuronCore
-Before you begin, we will demonstrate how to perform matrix operations on a NeuronCore. As discussed earlier, a NeuronCore is equipped with various compute engines, each optimized for specific types of arithmetic operations. The Tensor Engine on Trainium is specifically designed to accelerate these matrix operations, such as matrix multiplication and matrix transpose. 
-
-<p align="center">
-  <img src="/handout/tensor_engine.png" width=60% height=60%>
-</p>
-
-The above image depicts the architecture of the Tensor Engine. The Tensor Engine is built around a 128x128 [systolic processing array](https://gfxcourses.stanford.edu/cs149/fall25/lecture/proghardware/slide_10) which streams matrix data input from SBUF (on-chip storage) and writes the output to PSUM (also on-chip storage). Like SBUF, PSUM is fast on-chip memory, however it is much smaller than SBUF (2MiB vs 28 MiB) and serves a dedicated purpose of storing matrix multiplication results computed by the Tensor Engine. The Tensor Engine is able to read-add-write to every address in PSUM. Therefore, PSUM is useful when executing large matrix multiplications in a tiled manner, where the results of each matrix multiply are accumulated into the same output tile. 
+### An NKI Matrix Multiplication Kernel
 
 Recall that the Vector Engine has the capability to operate on SBUF tiles of size (128, 64k). However, the Tensor Engine contains unique SBUF tile size constraints which differ to that of the Vector Engine. Suppose we want the Tensor Engine to perform the matrix multiplication C = A x B, where A and B are located in SBUF, and the result C is stored in PSUM. Trainium imposes the following constraints. 
   - Matrix A - the left-hand side tile - can be no bigger than (128, 128)
   - Matrix B - the right-hand side tile - can be no bigger than (128, 512).
   - The output tile C in PSUM is restricted to a size of (128, 512).
-
-### An NKI Matrix Multiplication Kernel
 
 Given the constraints of the Tensor Engine, implementing matrix multiplication for arbitrary matrix dimensions on Trainium requires tiling the computation so it is performed as a sequence of matrix multiplications on fixed-size tiles. (This is similar to how vector addition in part 1 was tiled to work for large input vector sizes). The example below, which we modified from the [NKI tutorials](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/tutorials), demonstrates how to implement matrix multiplication using a tiled approach, where the tiles are sized to meet the Trainium Tensor engines tile size constraints. Note: a description of the code is provided after the code listing.
 
@@ -484,7 +481,7 @@ Let's break down the components of the kernel which computes the matrix multiply
       - Once the tiles for a given result block are fully computed, the partial sums in `res_psum` are copied to SBUF and cast to the required data type.
       - The final result is stored back into the `result` tensor at the corresponding position.
 
-> Note that we've replaced `nl.matmul()` and `nl.load()/nl.store()` with `nisa.nc_matmul()` and `nisa.dma_copy()` from the online tutorial. This lowers the nki.lang APIs to nki.nisa. We recommend for this year to be focused on using nki.isa APIs for any compute instruction. This has more deterministic behaviour on how it is lowered, and less unexpected behavior that may cause bogus compilation errors. 
+> Note that we've replaced `nl.matmul()` and `nl.load()/nl.store()` with `nisa.nc_matmul()` and `nisa.dma_copy()` from the online tutorial. This lowers the nki.lang APIs to nki.nisa. We recommend using nki.isa APIs for any compute instructions. This has more deterministic behaviour on how it is lowered, and less unexpected behavior that may cause bogus compilation errors. 
 
 In summary, this tiled implementation handles large matrix dimensions by breaking them into hardware-compatible tile sizes. It leverages specialized memory buffers (i.e., PSUM) to minimize memory latency and optimize matrix multiplication performance. You can read more about NKI matrix multiplication [here](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/tutorials/matrix_multiplication.html).
 
@@ -557,7 +554,8 @@ for i in range(Filter_Height):
         output += matmul(transpose(weight[i,j,:,:]), input_shifted)
 ```
 
-> Do note that this is just an algorithmic description, and the purpose of this assignment is for you to figure out to map this algorithmic description to an efficient implementation on this hardware! Think about how the loops over filter size fit into the loops for computing your tiled matrix multiplication. Consider different ways of rearranging those loops while keeping data locality in mind. You’ll want to keep intermediate results in PSUM at all times until the computation for that tile is fully completed, so that each part of the result array in SBUF is written only once.
+> [!NOTE]
+> **This is just an algorithmic description, and the purpose of this assignment is for you to figure out to map this algorithmic description to an efficient implementation on this hardware!** Think about how the loops over filter size fit into the loops for computing your tiled matrix multiplication. Consider different ways of rearranging those loops while keeping data locality in mind. You’ll want to keep intermediate results in PSUM at all times until the computation for that tile is fully completed, so that each part of the result array in SBUF is written only once.
 
 ### Max Pool Layer Overview
 Max pooling layers are commonly used in CNNs between successive convolutional layers to reduce the size of the feature maps. Not only does this prevent excessively large feature maps which can pose a problem for computational resources, but it also reduces the amount of parameters in the CNN which effectively reduces model overfitting.
@@ -585,7 +583,7 @@ Your fused kernel takes in the following parameters:
   - `bias` - The convolution filter biases. `bias` has shape `(Output Channels)`
   - `pool_size` - The size of the max pooling filter and pooling stride. You are guaranteed that the size of the input, the size of the filter, and the `pool_size` would be such that everything is nicely divisible. More concretely, `(Input Height - Filter Height + 1) % Pool Size == 0`.  Notice that if the value of `pool_size` is `1`, then the fused kernel operates as a normal convolution kernel. This gives us the flexibility to choose whether we want max pooling or not.
 
-Feel free to use the [course slides](https://gfxcourses.stanford.edu/cs149/fall25/lecture/dnninference/slide_57) on a convolution layer implementation as a starting point. If you are referencing the course slides, `INPUT_DEPTH` is synonymous with `Input Channels` and `LAYER_NUM_FILTERS` is synonymous with `Output Channels` in our naming scheme. Note that the input parameters to your fused kernel have different shapes than depicted in the convolution course slides. You are free to reshape the inputs into whatever shapes you desire by using the [NumPy reshape method](https://numpy.org/doc/stable/reference/generated/numpy.reshape.html) just as was done in `vector_add_stream kernel` from Part 1. We have also given you the NumPy implementations of a convolution layer and a maxpool layer in `part2/conv2d_numpy.py`. The NumPy implementations should give you a general outline of the programming logic for each layer. It might be a good exercise to think about how you would be able to fuse the NumPy implementations into a single layer, which is what you will do in your kernel. Feel free to look over the [NKI tutorials](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/tutorials.html) to learn more about additional optimizations or other API functions. You can also view the [API Reference Manual](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/api/index.html) to see all of the API functions that are available and their usage. You may find some of them useful. Hint: [nisa.tensor_reduce(nl.max, ...)](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.isa.tensor_reduce.html) should be helpful for max pooling. [nisa.tensor_tensorr](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.isa.tensor_tensor.html) should be helpful for adding bias.
+Feel free to use the [course slides](https://gfxcourses.stanford.edu/cs149/fall25/lecture/dnninference/slide_57) on a convolution layer implementation as a starting point. If you are referencing the course slides, `INPUT_DEPTH` is synonymous with `Input Channels` and `LAYER_NUM_FILTERS` is synonymous with `Output Channels` in our naming scheme. Note that the input parameters to your fused kernel have different shapes than depicted in the convolution course slides. You are free to reshape the inputs into whatever shapes you desire by using the [NumPy reshape method](https://numpy.org/doc/stable/reference/generated/numpy.reshape.html) just as was done in `vector_add_stream kernel` from Part 1. We have also given you the NumPy implementations of a convolution layer and a maxpool layer in `part2/conv2d_numpy.py`. The NumPy implementations should give you a general outline of the programming logic for each layer. It might be a good exercise to think about how you would be able to fuse the NumPy implementations into a single layer, which is what you will do in your kernel. Feel free to look over the [NKI tutorials](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/tutorials.html) to learn more about additional optimizations or other API functions. You can also view the [API Reference Manual](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/general/nki/api/index.html) to see all of the API functions that are available and their usage. You may find some of them useful. *Hint:* [nisa.tensor_reduce(nl.max, ...)](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.isa.tensor_reduce.html) should be helpful for max pooling. [nisa.tensor_tensor](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.isa.tensor_tensor.html) should be helpful for adding bias.
 
 ### What You Need To Do
 For this part of the assignment, focus exclusively on the file `part2/conv2d.py`. We've provided basic starter code; your task is to complete the implementation of the (fused) Conv2D kernel within the function `fused_conv2d_maxpool`.
@@ -605,7 +603,8 @@ The test harness will run correctness tests first, and run performance checks ne
 #### Writeup and Profiling
 Students are required to submit a write up briefly describing their implementations. Also describe how you went about optimizing your implementation. Make sure to profile your implementation, and report the achieved MFU (Model FLOPs Utilization), with both `float16` and `float32` data types. You can so by running `neuron-profile view -n [your_profile_name].neff -s [your_profile_name].ntff`. Run the test harness with the `--profile <profile_name>` flag to capture a trace.
 
-> It’s expected that you will see the warnings below when using the profiler, which is a known issue due to changes in the NKI compiler stack. Some benchmarking parameters will be missing, but the MFU value is not affected. Looking at the MFU value suffices for this class.
+> [!TIP]
+> It’s expected that you will see the warnings below when using the profiler, which is a known issue due to changes in the NKI compiler stack. Some benchmarking parameters will be missing, but the MFU value is still available by mousing over the "Cumulative Utilization" line in the Estimated MFU section of the GUI.
 
 <p align="center">
   <img src="handout/profiler-warning.png" alt="Profiler warning" width="90%">
@@ -626,8 +625,6 @@ Students are required to submit a write up briefly describing their implementati
   * Specifically, if you choose to use `nl.load(...)`, `x = nl.load(...)` (which creates a new array) is different from `x[...] = nl.load(...)` (which modifieds an existing array).
 * Avoid using block dimension, it's a pure software construct and does not impact hardware. (Don't worry about it if you don't know what it is.) Either put it in free dimensions or use lists of tensors. See public [documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/v2.26.0/general/nki/nki_block_dimension_migration_guide.html#nki-block-dimension-migration-guide).
 * For tensor indexing, prefer to do it with integer slicing. When more advanced indexing is required, use [`nl.mgrid`](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/nki/api/generated/nki.language.mgrid.html). Do not use nested slicing/mgrid. (e.g. t[0:128, 128:256][0:64, 0:64]). Do not use nl.arrange().
-
-
 
 
 ## Extra Credit
