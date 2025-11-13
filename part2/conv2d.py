@@ -75,4 +75,3 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                            " maxpool and store the result in X_out[b]")
 
     return X_out
-

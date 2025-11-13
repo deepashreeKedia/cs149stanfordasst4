@@ -66,7 +66,7 @@ def vector_add_tiled(a_vec, b_vec):
     M = a_vec.shape[0]
     
     # TODO: You should modify this variable for Step 1
-    ROW_CHUNK = 1
+    ROW_CHUNK = 128
 
     # Loop over the total number of chunks, we can use affine_range
     # because there are no loop-carried dependencies
@@ -102,7 +102,7 @@ def vector_add_stream(a_vec, b_vec):
     M = a_vec.shape[0]
 
     # TODO: You should modify this variable for Step 2a
-    FREE_DIM = 2
+    FREE_DIM = 1000
 
     # The maximum size of our Partition Dimension
     PARTITION_DIM = 128
@@ -147,6 +147,28 @@ def matrix_transpose(a_tensor):
 
     assert M % tile_dim == N % tile_dim == 0, "Matrix dimensions not divisible by tile dimension!"
 
-    # TODO: Your implementation here. The only compute instruction you should use is `nisa.nc_transpose`.
+    # Loop over all tiles in the input matrix
+    # Use affine_range because there are no loop-carried dependencies
+    for i in nl.affine_range(M // tile_dim):
+        for j in nl.affine_range(N // tile_dim):
+            # Allocate space for input tile in SBUF
+            input_tile = nl.ndarray((tile_dim, tile_dim), dtype=a_tensor.dtype, buffer=nl.sbuf)
+            
+            # Load input tile from HBM to SBUF
+            nisa.dma_copy(src=a_tensor[i * tile_dim : (i + 1) * tile_dim, 
+                                        j * tile_dim : (j + 1) * tile_dim], 
+                         dst=input_tile)
+            
+            # Transpose the tile using nc_transpose (result stored in PSUM)
+            transposed_psum = nisa.nc_transpose(input_tile)
+            
+            # Copy from PSUM to SBUF using tensor_copy (returns a tile in SBUF)
+            transposed_sbuf = nisa.tensor_copy(transposed_psum)
+            
+            # Store the transposed tile to the output matrix at position (j, i)
+            # Note: tile at (i, j) in input becomes tile at (j, i) in output
+            nisa.dma_copy(src=transposed_sbuf, 
+                         dst=out[j * tile_dim : (j + 1) * tile_dim,
+                                i * tile_dim : (i + 1) * tile_dim])
 
     return out
