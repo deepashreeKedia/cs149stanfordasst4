@@ -68,7 +68,7 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         buffer=nl.hbm,
     )
 
-    compute_dtype = nl.float32 if X.dtype == nl.float16 else X.dtype
+    compute_dtype = nl.float32
     output_dtype = X.dtype
 
     max_rows = max(1, tile_free_max // out_width)
@@ -111,6 +111,45 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
             if bias_tile.dtype != compute_dtype:
                 bias_tile = nl.copy(bias_tile, dtype=compute_dtype)
 
+            weights_cache = nl.ndarray(
+                (
+                    tile_in,
+                    num_in_tiles * filter_height * filter_width * tile_out,
+                ),
+                dtype=W.dtype,
+                buffer=nl.sbuf,
+            )
+
+            for ic_tile_idx in nl.affine_range(num_in_tiles):
+                ic_start = ic_tile_idx * tile_in
+                weights_block = nl.ndarray(
+                    (tile_out, tile_in, filter_height, filter_width),
+                    dtype=W.dtype,
+                    buffer=nl.sbuf,
+                )
+                nisa.dma_copy(
+                    src=W[
+                        oc_start : oc_start + tile_out,
+                        ic_start : ic_start + tile_in,
+                        0:filter_height,
+                        0:filter_width,
+                    ],
+                    dst=weights_block,
+                )
+                for fh in range(filter_height):
+                    for fw in range(filter_width):
+                        weight_tile = nisa.tensor_copy(weights_block[:, :, fh, fw])
+                        weight_psum = nisa.nc_transpose(weight_tile)
+                        transposed_tile = nisa.tensor_copy(weight_psum)
+                        cache_slot = (
+                            ic_tile_idx * filter_height * filter_width
+                            + fh * filter_width
+                            + fw
+                        )
+                        col_start = cache_slot * tile_out
+                        col_end = col_start + tile_out
+                        weights_cache[:, col_start:col_end] = transposed_tile
+
             for h_tile_idx in nl.affine_range(num_row_tiles):
                 row_start = h_tile_idx * rows_per_block
 
@@ -135,41 +174,28 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         dst=input_block,
                     )
 
-                    weights_block = nl.ndarray(
-                        (tile_out, tile_in, filter_height, filter_width),
-                        dtype=W.dtype,
-                        buffer=nl.sbuf,
-                    )
-                    nisa.dma_copy(
-                        src=W[
-                            oc_start : oc_start + tile_out,
-                            ic_start : ic_start + tile_in,
-                            0:filter_height,
-                            0:filter_width,
-                        ],
-                        dst=weights_block,
-                    )
-
                     for fh in range(filter_height):
                         for fw in range(filter_width):
-                            weight_tile = nisa.tensor_copy(weights_block[:, :, fh, fw])
-                            weight_psum = nisa.nc_transpose(weight_tile)
-                            lhs_tile = nisa.tensor_copy(weight_psum)
-                            if lhs_tile.dtype != compute_dtype:
-                                lhs_tile = nl.copy(lhs_tile, dtype=compute_dtype)
-
+                            cache_slot = (
+                                ic_tile_idx * filter_height * filter_width
+                                + fh * filter_width
+                                + fw
+                            )
+                            col_start = cache_slot * tile_out
+                            col_end = col_start + tile_out
+                            lhs_tile = nisa.tensor_copy(
+                                weights_cache[:, col_start:col_end]
+                            )
                             input_tile = nisa.tensor_copy(
                                 input_block[:, fh : fh + rows, fw : fw + out_width]
                             )
                             rhs_tile = input_tile.reshape((tile_in, n_cols))
-                            if rhs_tile.dtype != compute_dtype:
-                                rhs_tile = nl.copy(rhs_tile, dtype=compute_dtype)
 
                             res_psum += nisa.nc_matmul(lhs_tile, rhs_tile)
 
                 res_tile = nisa.tensor_copy(res_psum)
                 res_tile = res_tile.reshape((tile_out, n_cols))
-                res_with_bias = nisa.tensor_scalar(res_tile, nl.add, bias_tile)
+                res_with_bias = nisa.tensor_tensor(res_tile, bias_tile, op=nl.add)
                 res_with_bias = res_with_bias.reshape((tile_out, rows, out_width))
 
                 if pool_size > 1:
