@@ -50,12 +50,16 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
     out_pool_height = out_height // pool_size
     out_pool_width = out_width // pool_size
-    
-    # Can assume multiple of 128 to avoid using mask
-    assert in_channels % 128 == out_channels % 128 == 0
 
-    # Can assume one PSUM bank can at least fit one row of the pixels
-    assert nl.tile_size.gemm_moving_fmax >= out_width
+    tile_in = int(nl.tile_size.pmax)
+    tile_out = int(nl.tile_size.gemm_stationary_fmax)
+    tile_free_max = int(nl.tile_size.gemm_moving_fmax)
+
+    assert in_channels % tile_in == 0, "Input channels must be multiples of 128"
+    assert out_channels % tile_out == 0, "Output channels must be multiples of 128"
+    assert tile_free_max >= out_width, "Output width must fit in tensor engine free dim"
+    if pool_size > 1:
+        assert out_height % pool_size == 0 and out_width % pool_size == 0, "Pooling requires divisible dims"
 
     # Initialize output array
     X_out = nl.ndarray(
@@ -64,14 +68,125 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
         buffer=nl.hbm,
     )
 
-    # Various tiling dimensions (You may want to define more of them)
-    c_in_pmax = nl.tile_size.pmax
-    n_tiles_c_in = in_channels // c_in_pmax
+    compute_dtype = nl.float32 if X.dtype == nl.float16 else X.dtype
+    output_dtype = X.dtype
 
-    # Process the images in batches
+    max_rows = max(1, tile_free_max // out_width)
+    if pool_size > max_rows:
+        raise AssertionError("Free dimension too small for requested pool size")
+    max_rows = min(max_rows, out_height)
+    assert out_height >= pool_size, "Pool size exceeds output height"
+    max_rows -= max_rows % pool_size
+    if max_rows == 0:
+        max_rows = pool_size
+
+    rows_per_block = max_rows
+    while rows_per_block > pool_size and out_height % rows_per_block != 0:
+        rows_per_block -= pool_size
+    if out_height % rows_per_block != 0:
+        rows_per_block = pool_size
+    assert rows_per_block > 0
+    assert out_height % rows_per_block == 0
+    assert rows_per_block * out_width <= tile_free_max
+
+    rows = rows_per_block
+    rows_out = rows // pool_size
+    cols_out = out_width // pool_size if pool_size > 1 else out_width
+    n_cols = rows * out_width
+    assert n_cols <= tile_free_max
+
+    num_row_tiles = out_height // rows
+    num_out_tiles = out_channels // tile_out
+    num_in_tiles = in_channels // tile_in
+
     for b in nl.affine_range(batch_size):
-        raise RuntimeError("Please fill your implementation of computing convolution"
-                           " of X[b] with the weights W and bias b, followed by a"
-                           " maxpool and store the result in X_out[b]")
+        for oc_tile_idx in nl.affine_range(num_out_tiles):
+            oc_start = oc_tile_idx * tile_out
+
+            bias_tile = nl.ndarray((tile_out, 1), dtype=bias.dtype, buffer=nl.sbuf)
+            nisa.dma_copy(
+                src=bias[oc_start : oc_start + tile_out],
+                dst=bias_tile[:, 0],
+            )
+            if bias_tile.dtype != compute_dtype:
+                bias_tile = nl.copy(bias_tile, dtype=compute_dtype)
+
+            for h_tile_idx in nl.affine_range(num_row_tiles):
+                row_start = h_tile_idx * rows_per_block
+
+                res_psum = nl.zeros((tile_out, n_cols), dtype=compute_dtype, buffer=nl.psum)
+
+                for fh in range(filter_height):
+                    for fw in range(filter_width):
+                        row_offset = row_start + fh
+                        col_offset = fw
+                        for ic_tile_idx in nl.affine_range(num_in_tiles):
+                            ic_start = ic_tile_idx * tile_in
+
+                            weight_tile = nl.ndarray(
+                                (tile_out, tile_in), dtype=W.dtype, buffer=nl.sbuf
+                            )
+                            nisa.dma_copy(
+                                src=W[
+                                    oc_start : oc_start + tile_out,
+                                    ic_start : ic_start + tile_in,
+                                    fh,
+                                    fw,
+                                ],
+                                dst=weight_tile,
+                            )
+                            weight_psum = nisa.nc_transpose(weight_tile)
+                            lhs_tile = nisa.tensor_copy(weight_psum)
+                            if lhs_tile.dtype != compute_dtype:
+                                lhs_tile = nl.copy(lhs_tile, dtype=compute_dtype)
+
+                            input_tile = nl.ndarray(
+                                (tile_in, rows, out_width), dtype=X.dtype, buffer=nl.sbuf
+                            )
+                            nisa.dma_copy(
+                                src=X[
+                                    b,
+                                    ic_start : ic_start + tile_in,
+                                    row_offset : row_offset + rows,
+                                    col_offset : col_offset + out_width,
+                                ],
+                                dst=input_tile,
+                            )
+                            rhs_tile = input_tile.reshape((tile_in, n_cols))
+                            if rhs_tile.dtype != compute_dtype:
+                                rhs_tile = nl.copy(rhs_tile, dtype=compute_dtype)
+
+                            res_psum += nisa.nc_matmul(lhs_tile, rhs_tile)
+
+                res_tile = nisa.tensor_copy(res_psum)
+                res_tile = res_tile.reshape((tile_out, n_cols))
+                res_with_bias = nisa.tensor_scalar(res_tile, nl.add, bias_tile)
+                res_with_bias = res_with_bias.reshape((tile_out, rows, out_width))
+
+                if pool_size > 1:
+                    width_grouped = res_with_bias.reshape(
+                        (tile_out, rows, cols_out, pool_size)
+                    )
+                    reduced_w = nisa.tensor_reduce(nl.max, width_grouped, axis=[3])
+                    height_grouped = reduced_w.reshape(
+                        (tile_out, rows_out, pool_size, cols_out)
+                    )
+                    pooled_tile = nisa.tensor_reduce(nl.max, height_grouped, axis=[2])
+                else:
+                    pooled_tile = res_with_bias
+
+                if pooled_tile.dtype != output_dtype:
+                    pooled_tile = nl.copy(pooled_tile, dtype=output_dtype)
+
+                row_out_start = row_start // pool_size
+                nisa.dma_copy(
+                    src=pooled_tile,
+                    dst=X_out[
+                        b,
+                        oc_start : oc_start + tile_out,
+                        row_out_start : row_out_start + rows_out,
+                        0:cols_out,
+                    ],
+                )
 
     return X_out
