@@ -147,28 +147,78 @@ def matrix_transpose(a_tensor):
 
     assert M % tile_dim == N % tile_dim == 0, "Matrix dimensions not divisible by tile dimension!"
 
-    # Loop over all tiles in the input matrix
-    # Use affine_range because there are no loop-carried dependencies
-    for i in nl.affine_range(M // tile_dim):
-        for j in nl.affine_range(N // tile_dim):
-            # Allocate space for input tile in SBUF
-            input_tile = nl.ndarray((tile_dim, tile_dim), dtype=a_tensor.dtype, buffer=nl.sbuf)
-            
-            # Load input tile from HBM to SBUF
-            nisa.dma_copy(src=a_tensor[i * tile_dim : (i + 1) * tile_dim, 
-                                        j * tile_dim : (j + 1) * tile_dim], 
-                         dst=input_tile)
-            
-            # Transpose the tile using nc_transpose (result stored in PSUM)
-            transposed_psum = nisa.nc_transpose(input_tile)
-            
-            # Copy from PSUM to SBUF using tensor_copy (returns a tile in SBUF)
-            transposed_sbuf = nisa.tensor_copy(transposed_psum)
-            
-            # Store the transposed tile to the output matrix at position (j, i)
-            # Note: tile at (i, j) in input becomes tile at (j, i) in output
-            nisa.dma_copy(src=transposed_sbuf, 
-                         dst=out[j * tile_dim : (j + 1) * tile_dim,
-                                i * tile_dim : (i + 1) * tile_dim])
+    tiles_per_col = M // tile_dim
+    tiles_per_row = N // tile_dim
+
+    # Number of 128x128 tiles we load together along the row dimension.
+    # A larger block amortizes DMA overhead but must still fit in SBUF.
+    MAX_TILES_PER_BLOCK = 8
+    block_tile_count = min(MAX_TILES_PER_BLOCK, tiles_per_row)
+
+    row_block = nl.ndarray(
+        (tile_dim, tile_dim * block_tile_count), dtype=a_tensor.dtype, buffer=nl.sbuf
+    )
+
+    num_full_blocks = tiles_per_row // block_tile_count
+    remainder_tiles = tiles_per_row % block_tile_count
+
+    for tile_row in nl.affine_range(tiles_per_col):
+        row_start = tile_row * tile_dim
+        row_end = row_start + tile_dim
+
+        for block_idx in nl.affine_range(num_full_blocks):
+            col_tile_start = block_idx * block_tile_count
+            cols_in_block = block_tile_count * tile_dim
+            col_start = col_tile_start * tile_dim
+            col_end = col_start + cols_in_block
+
+            # Load a contiguous strip of tiles (tile_dim x cols_in_block) once.
+            nisa.dma_copy(
+                src=a_tensor[row_start:row_end, col_start:col_end],
+                dst=row_block[:, 0:cols_in_block],
+            )
+
+            for tile_idx in nl.affine_range(block_tile_count):
+                tile_col = col_tile_start + tile_idx
+                col_offset = tile_idx * tile_dim
+
+                input_tile = row_block[:, col_offset : col_offset + tile_dim]
+                transposed_psum = nisa.nc_transpose(input_tile)
+                transposed_tile = nisa.tensor_copy(transposed_psum)
+
+                nisa.dma_copy(
+                    src=transposed_tile,
+                    dst=out[
+                        tile_col * tile_dim : (tile_col + 1) * tile_dim,
+                        row_start:row_end,
+                    ],
+                )
+
+        if remainder_tiles > 0:
+            col_tile_start = num_full_blocks * block_tile_count
+            cols_in_block = remainder_tiles * tile_dim
+            col_start = col_tile_start * tile_dim
+            col_end = col_start + cols_in_block
+
+            nisa.dma_copy(
+                src=a_tensor[row_start:row_end, col_start:col_end],
+                dst=row_block[:, 0:cols_in_block],
+            )
+
+            for tile_idx in nl.affine_range(remainder_tiles):
+                tile_col = col_tile_start + tile_idx
+                col_offset = tile_idx * tile_dim
+
+                input_tile = row_block[:, col_offset : col_offset + tile_dim]
+                transposed_psum = nisa.nc_transpose(input_tile)
+                transposed_tile = nisa.tensor_copy(transposed_psum)
+
+                nisa.dma_copy(
+                    src=transposed_tile,
+                    dst=out[
+                        tile_col * tile_dim : (tile_col + 1) * tile_dim,
+                        row_start:row_end,
+                    ],
+                )
 
     return out
