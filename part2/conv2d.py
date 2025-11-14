@@ -135,20 +135,24 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                         dst=input_block,
                     )
 
+                    weights_block = nl.ndarray(
+                        (tile_out, tile_in, filter_height, filter_width),
+                        dtype=W.dtype,
+                        buffer=nl.sbuf,
+                    )
+                    nisa.dma_copy(
+                        src=W[
+                            oc_start : oc_start + tile_out,
+                            ic_start : ic_start + tile_in,
+                            0:filter_height,
+                            0:filter_width,
+                        ],
+                        dst=weights_block,
+                    )
+
                     for fh in range(filter_height):
                         for fw in range(filter_width):
-                            weight_tile = nl.ndarray(
-                                (tile_out, tile_in), dtype=W.dtype, buffer=nl.sbuf
-                            )
-                            nisa.dma_copy(
-                                src=W[
-                                    oc_start : oc_start + tile_out,
-                                    ic_start : ic_start + tile_in,
-                                    fh,
-                                    fw,
-                                ],
-                                dst=weight_tile,
-                            )
+                            weight_tile = nisa.tensor_copy(weights_block[:, :, fh, fw])
                             weight_psum = nisa.nc_transpose(weight_tile)
                             lhs_tile = nisa.tensor_copy(weight_psum)
                             if lhs_tile.dtype != compute_dtype:
