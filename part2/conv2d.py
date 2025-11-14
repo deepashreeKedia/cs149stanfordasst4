@@ -116,13 +116,27 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
 
                 res_psum = nl.zeros((tile_out, n_cols), dtype=compute_dtype, buffer=nl.psum)
 
-                for fh in range(filter_height):
-                    for fw in range(filter_width):
-                        row_offset = row_start + fh
-                        col_offset = fw
-                        for ic_tile_idx in nl.affine_range(num_in_tiles):
-                            ic_start = ic_tile_idx * tile_in
+                expanded_rows = rows + filter_height - 1
+                expanded_cols = out_width + filter_width - 1
 
+                for ic_tile_idx in nl.affine_range(num_in_tiles):
+                    ic_start = ic_tile_idx * tile_in
+
+                    input_block = nl.ndarray(
+                        (tile_in, expanded_rows, expanded_cols), dtype=X.dtype, buffer=nl.sbuf
+                    )
+                    nisa.dma_copy(
+                        src=X[
+                            b,
+                            ic_start : ic_start + tile_in,
+                            row_start : row_start + expanded_rows,
+                            0 : expanded_cols,
+                        ],
+                        dst=input_block,
+                    )
+
+                    for fh in range(filter_height):
+                        for fw in range(filter_width):
                             weight_tile = nl.ndarray(
                                 (tile_out, tile_in), dtype=W.dtype, buffer=nl.sbuf
                             )
@@ -140,17 +154,8 @@ def fused_conv2d_maxpool(X, W, bias, pool_size=1):
                             if lhs_tile.dtype != compute_dtype:
                                 lhs_tile = nl.copy(lhs_tile, dtype=compute_dtype)
 
-                            input_tile = nl.ndarray(
-                                (tile_in, rows, out_width), dtype=X.dtype, buffer=nl.sbuf
-                            )
-                            nisa.dma_copy(
-                                src=X[
-                                    b,
-                                    ic_start : ic_start + tile_in,
-                                    row_offset : row_offset + rows,
-                                    col_offset : col_offset + out_width,
-                                ],
-                                dst=input_tile,
+                            input_tile = nisa.tensor_copy(
+                                input_block[:, fh : fh + rows, fw : fw + out_width]
                             )
                             rhs_tile = input_tile.reshape((tile_in, n_cols))
                             if rhs_tile.dtype != compute_dtype:
